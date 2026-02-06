@@ -151,7 +151,19 @@
 	 uint8_t SA;
 	 uint8_t TC;
  };
- 
+
+
+#define SH_CACHE_SIZE (8192)
+#define SH_CACHE_LINE_SIZE (64)
+#define SH_CACHE_ENTRY_COUNT (SH_CACHE_SIZE / SH_CACHE_LINE_SIZE)
+#define SH_CACHE_ASSOCIATIVITY (4)
+#define SH_CACHE_BLOCKS (SH_CACHE_ENTRY_COUNT / SH_CACHE_ASSOCIATIVITY)
+
+ struct sh_cache_entry
+ {
+	 uint64_t lru_counter;
+	 uint32_t tag;
+ };
  
  typedef void (*sh4_ftcsr_callback)(uint32_t);
  
@@ -253,6 +265,7 @@
 	 void func_STCSPC();
  
 	 bool is_in_cache(uint32_t address);
+	 bool is_cacheable(uint32_t address);
 	 void func_drc_memory_read_timing();
 	 void func_drc_memory_write_timing();
  
@@ -387,6 +400,9 @@
 	 uint32_t  m_sh3internal_lower[0x1000];
  
 	 uint64_t m_debugger_temp;
+
+	 uint64_t m_lru_access_counter;
+	 struct sh_cache_entry m_sh_cache[SH_CACHE_BLOCKS][SH_CACHE_ASSOCIATIVITY];
  
 	 inline void sh4_check_pending_irq(const char *message) // look for highest priority active exception and handle it
 	 {

@@ -1701,6 +1701,9 @@
  
 	 m_sh4_mmu_enabled = false;
 	 m_cache_dirty = true;
+
+	 m_lru_access_counter = 0;
+	 memset(m_sh_cache, 0, sizeof(struct sh_cache_entry) * SH_CACHE_ENTRY_COUNT);
  }
  
  /*-------------------------------------------------
@@ -1979,9 +1982,13 @@
 			 opcode = read_word(m_sh2_state->pc); // should probably use a different function as this needs to go through the ITLB
  
 		 // Determine the number of cycles this instruction will take
+		 uint32_t pc_addr = (m_sh4_mmu_enabled) ? m_sh2_state->pc : (m_sh2_state->pc & SH34_AM);
+		 bool is_in_icache = is_in_cache(pc_addr);
 		 bool is_sh4 = (m_cpu_type == CPU_TYPE_SH4);
 		 bool in_delay_slot = (m_sh2_state->m_delay != 0);
 		 int base_cycles = sh_get_instruction_cycles(opcode, is_sh4, in_delay_slot);
+
+		 base_cycles += sh_get_memory_cycles(pc_addr, false, is_sh4, is_in_icache, true, 2);
  
 		 if (m_sh2_state->m_delay)
 		 {
@@ -2465,7 +2472,7 @@
  }
  
  // Checks if an address is likely to be cached based on SH3/SH4 cache rules
- bool sh34_base_device::is_in_cache(uint32_t address)
+ bool sh34_base_device::is_cacheable(uint32_t address)
  {
 	 // Basic cache architecture of SH3/SH4:
 	 // 1. P0 region (0x00000000-0x7FFFFFFF) is cacheable
@@ -2523,6 +2530,44 @@
 	 }
  
 	 // P1, P2, P3 and P4 regions are never cached
+	 return false;
+ }
+
+ bool sh34_base_device::is_in_cache(uint32_t address)
+ {
+	 if (!is_cacheable(address))
+	 {
+		 return false;
+	 }
+
+	 uint32_t cache_address = address / SH_CACHE_LINE_SIZE;
+	 uint32_t cache_block = cache_address % SH_CACHE_BLOCKS;
+
+	 for (int i = 0; i < SH_CACHE_ASSOCIATIVITY; i++)
+	 {
+		 struct sh_cache_entry *curr = &m_sh_cache[cache_block][i];
+		 if (curr->tag == cache_address)
+		 {
+			 curr->lru_counter = ++m_lru_access_counter;
+			 return true;
+		 }
+	 }
+
+	 int replace_idx = 0;
+	 uint64_t lowest_lru = m_sh_cache[cache_block][0].lru_counter;
+
+	 for (int i = 1; i < SH_CACHE_ASSOCIATIVITY; i++)
+	 {
+		 if (m_sh_cache[cache_block][i].lru_counter < lowest_lru)
+		 {
+			 lowest_lru = m_sh_cache[cache_block][i].lru_counter;
+			 replace_idx = i;
+		 }
+	 }
+
+	 m_sh_cache[cache_block][replace_idx].tag = cache_address;
+	 m_sh_cache[cache_block][replace_idx].lru_counter = ++m_lru_access_counter;
+
 	 return false;
  }
  

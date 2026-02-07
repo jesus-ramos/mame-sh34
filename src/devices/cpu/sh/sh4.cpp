@@ -3204,11 +3204,22 @@
  
 	 block.end();
  }
- 
+
+ static void cfunc_drc_update_icache(void* param)
+ {
+	 sh34_base_device *dev = (sh34_base_device*)param;
+	 uint32_t pc_addr = dev->m_sh2_state->pc & SH34_AM;
+	 bool is_in_icache = dev->is_in_cache(pc_addr);
+	 dev->m_sh2_state->icount -= sh_get_memory_cycles(pc_addr, false, false /* is_sh4 */, is_in_icache, true, 2);
+	 dev->is_in_cache(pc_addr + 2); // hacked up prefetch
+ }
+
  bool sh34_base_device::generate_group_0(drcuml_block &block, compiler_state &compiler, const opcode_desc *desc, uint16_t opcode, int in_delay_slot, uint32_t ovrpc)
  {
 	 bool is_sh4 = (m_cpu_type == CPU_TYPE_SH4);
 	 compiler.cycles += sh_get_instruction_cycles(opcode, is_sh4, in_delay_slot);
+
+	 UML_CALLC(block, cfunc_drc_update_icache, this);
  
 	 switch (opcode & 0xff)
 	 {
@@ -3500,6 +3511,8 @@
  {
 	 bool is_sh4 = (m_cpu_type == CPU_TYPE_SH4);
 	 compiler.cycles += sh_get_instruction_cycles(opcode, is_sh4, in_delay_slot);
+
+	 UML_CALLC(block, cfunc_drc_update_icache, this);
  
 	 switch (opcode & 0xff)
 	 {
@@ -3839,6 +3852,8 @@
  {
 	 bool is_sh4 = (m_cpu_type == CPU_TYPE_SH4);
 	 compiler.cycles += sh_get_instruction_cycles(opcode, is_sh4, in_delay_slot);
+
+	 UML_CALLC(block, cfunc_drc_update_icache, this);
  
 	 switch (opcode & 0x0f)
 	 {
@@ -4119,6 +4134,8 @@
  {
 	 bool is_sh4 = (m_cpu_type == CPU_TYPE_SH4);
 	 compiler.cycles += sh_get_instruction_cycles(opcode, is_sh4, in_delay_slot);
+
+	 UML_CALLC(block, cfunc_drc_update_icache, this);
  
 	 switch ((opcode >> 4) & 0x0f)
 	 {

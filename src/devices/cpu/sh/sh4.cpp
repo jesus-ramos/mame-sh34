@@ -1968,7 +1968,7 @@
 		 m_sh2_state->icount = 0;
 		 return;
 	 }
- 
+
 	 do
 	 {
 		 m_sh2_state->m_ppc = m_sh2_state->pc & SH34_AM;
@@ -3210,7 +3210,11 @@
 	 sh34_base_device *dev = (sh34_base_device*)param;
 	 uint32_t pc_addr = dev->m_sh2_state->pc & SH34_AM;
 	 bool is_in_icache = dev->is_in_cache(pc_addr);
-	 dev->m_sh2_state->icount -= sh_get_memory_cycles(pc_addr, false, false /* is_sh4 */, is_in_icache, true, 2);
+	 if (!is_in_icache)
+	 {
+		 dev->m_sh2_state->icount -= sh_get_memory_cycles(pc_addr, false, false /* is_sh4 */, is_in_icache, true, 2);
+	 }
+
 	 uint16_t opcode = dev->m_pr16(pc_addr);
 
 	 bool branch_predict = false;
@@ -4486,5 +4490,4 @@
 	 load_fast_iregs(block);
 	 return true;
  }
- 
- 
+

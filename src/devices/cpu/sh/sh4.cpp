@@ -3211,7 +3211,67 @@
 	 uint32_t pc_addr = dev->m_sh2_state->pc & SH34_AM;
 	 bool is_in_icache = dev->is_in_cache(pc_addr);
 	 dev->m_sh2_state->icount -= sh_get_memory_cycles(pc_addr, false, false /* is_sh4 */, is_in_icache, true, 2);
-	 dev->is_in_cache(pc_addr + 2); // hacked up prefetch
+	 uint16_t opcode = dev->m_pr16(pc_addr);
+
+	 bool branch_predict = false;
+
+	 // Handle some basic branch predictor behavior here, just guessing based on taking forward branches
+	 // This is going to be ugly for now
+	 switch ((opcode >> 8) & 0xff)
+	 {
+	 case 13: // BTS
+	 case 15: // BFS
+		 // prefetch next instruction for delayed branch
+		 dev->is_in_cache(pc_addr + 2);
+		 [[fallthrough]];
+	 case 9 : // BT
+	 case 11: // BF
+	 {
+		 int32_t displacement = util::sext(opcode, 8);
+		 uint32_t target_jmp = (pc_addr + 2) + displacement * 2 + 2;
+		 // Assume a forward branch and prefetch there
+		 dev->is_in_cache(target_jmp);
+		 branch_predict = true;
+		 break;
+	 }
+	 }
+
+	 switch ((opcode >> 12) & 0xff)
+	 {
+	 case 10: // BRA
+	 case 11: // BSR
+	 {
+		 int32_t displacement = util::sext(opcode, 12);
+		 uint32_t target_jmp = (pc_addr + 2) + displacement * 2 + 2;
+		 dev->is_in_cache(target_jmp);
+		 branch_predict = true;
+		 break;
+	 }
+	 }
+
+	 switch (opcode & 0xf0ff)
+	 {
+	 case 0x402B: // JMP
+	 case 0x400B: // JSR
+	 {
+		 uint32_t target_jmp = dev->m_sh2_state->m_fr[(opcode & 0xf00) >> 8];
+		 dev->is_in_cache(target_jmp);
+		 branch_predict = true;
+		 break;
+	 }
+	 case 0x0b: // RTS
+	 {
+		 dev->is_in_cache(dev->m_sh2_state->pr);
+		 branch_predict = true;
+		 break;
+	 }
+	 }
+
+	 // default prefetch next instruction
+	 if (!branch_predict)
+	 {
+		 dev->is_in_cache(pc_addr + 2);
+	 }
  }
 
  bool sh34_base_device::generate_group_0(drcuml_block &block, compiler_state &compiler, const opcode_desc *desc, uint16_t opcode, int in_delay_slot, uint32_t ovrpc)

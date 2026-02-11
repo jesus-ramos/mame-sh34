@@ -398,7 +398,8 @@
      bool is_unaligned = (address & (access_size - 1)) != 0;
  
      // Check for potential burst mode (only applies to certain regions and access patterns)
-     bool can_use_burst = !is_write && (region == SH_REGION_MAIN_MEM || region == SH_REGION_CACHED);
+     //bool can_use_burst = !is_write && (region == SH_REGION_MAIN_MEM || region == SH_REGION_CACHED);
+	 bool can_use_burst = false;
      bool is_burst_continuation = can_use_burst &&
                                  sh_is_burst_continuation(address, sh_mem_context.last_address, access_size) &&
                                  !sh_mem_context.last_was_write;
@@ -420,8 +421,9 @@
      bool is_page_miss = is_sdram_region && !is_page_hit && sh_mem_context.last_address != 0;
  
      // Check for TLB miss simulation (simplified model, not full TLB simulation)
-     bool is_tlb_hit = sh_mem_context.tlb_cache_valid &&
-                         ((address & 0xFFFFF000) == sh_mem_context.tlb_cache_addr);
+     //bool is_tlb_hit = sh_mem_context.tlb_cache_valid &&
+                         //((address & 0xFFFFF000) == sh_mem_context.tlb_cache_addr);
+	 bool is_tlb_hit = true;
      bool is_tlb_miss = !is_tlb_hit && address < 0x80000000; // Only P0/U0 uses TLB
  
      // Apply base cycle penalty based on region type and operation
@@ -496,9 +498,12 @@
      // Apply additional penalties based on conditions
  
      // Cache miss penalty (if cached region but not cached)
-     if ((region == SH_REGION_CACHED) && !is_cached && !is_write) {
-         cycle_penalty += std::max(mem_timing.cache_miss_penalty, mem_timing.cache_line_fill);
-     }
+     //if ((region == SH_REGION_CACHED) && !is_cached && !is_write) {
+         //cycle_penalty += std::max(mem_timing.cache_miss_penalty, mem_timing.cache_line_fill);
+     //}
+	 if ((region == SH_REGION_CACHED) && !is_cached) {
+		 cycle_penalty += 25; // Average cycles on a cache fetch, ~185 nanos. Could be higher due to writeback cache eviction and other things
+	 }
  
      // Unaligned access penalty
      if (is_unaligned && access_size > 1) {

@@ -415,10 +415,10 @@
      }
  
      // Check for SDRAM page hit/miss (only relevant for SDRAM regions)
-     bool is_sdram_region = (region == SH_REGION_MAIN_MEM);
+     //bool is_sdram_region = (region == SH_REGION_MAIN_MEM);
      uint32_t current_sdram_page = sh_get_sdram_page(address);
-     bool is_page_hit = is_sdram_region && (current_sdram_page == sh_mem_context.last_sdram_page);
-     bool is_page_miss = is_sdram_region && !is_page_hit && sh_mem_context.last_address != 0;
+     bool is_page_hit = (current_sdram_page == sh_mem_context.last_sdram_page);
+     bool is_page_miss = !is_page_hit && sh_mem_context.last_address != 0;
  
      // Check for TLB miss simulation (simplified model, not full TLB simulation)
      //bool is_tlb_hit = sh_mem_context.tlb_cache_valid &&
@@ -501,8 +501,16 @@
      //if ((region == SH_REGION_CACHED) && !is_cached && !is_write) {
          //cycle_penalty += std::max(mem_timing.cache_miss_penalty, mem_timing.cache_line_fill);
      //}
-	 if ((region == SH_REGION_CACHED) && !is_cached) {
-		 cycle_penalty += 25; // Average cycles on a cache fetch, ~185 nanos. Could be higher due to writeback cache eviction and other things
+	 if (!is_cached) {
+		 if (is_page_hit)
+		 {
+			 cycle_penalty = 6;
+		 }
+		 else
+		 {
+			 cycle_penalty = 15;
+		 }
+		 cycle_penalty += 1 + mem_timing.cache_line_fill;
 	 }
  
      // Unaligned access penalty
@@ -539,9 +547,7 @@
      }
  
      // Update SDRAM page tracking
-     if (is_sdram_region) {
-         sh_mem_context.last_sdram_page = current_sdram_page;
-     }
+     sh_mem_context.last_sdram_page = current_sdram_page;
  
      // Update TLB cache simulation
      if (is_tlb_miss) {

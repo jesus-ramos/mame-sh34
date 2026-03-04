@@ -52,7 +52,8 @@ static bool is_cacheable(uint32_t address)
 	// 0x00000000 - 0x80000000 2GB cacheable virtual space
 	// 0x80000000 - 0xA0000000 0.5GB fixed physical cacheable space
 	// 0xC0000000 - 0xE0000000 0.5GB virtual cacheable space
-	return address < 0xA0000000 || (address >= 0xC0000000 && address < 0xE0000000);
+	uint8_t region = address >> 29;
+	return region != 0x5 && region != 0x7;
 }
 
 // Returns true on cache hit, false if there was a miss cache miss and updates the cache state to reflect the access
@@ -113,21 +114,30 @@ bool sh7709s_device::cache_access(uint32_t address, bool write)
 	return false;
 }
 
-#define SH7709S_AREA_SIZE (0x4000000)
+#define SH7709S_AREA_MASK (0x1FFFFFFF)
+
+unsigned int get_area(uint32_t address)
+{
+	// Mask to 29 bit physical space
+	uint32_t phys_mask = address & SH7709S_AREA_MASK;
+
+	return phys_mask >> 26;
+}
 
 static bool is_sdram_region(uint32_t address)
 {
-	unsigned int area = address / SH7709S_AREA_SIZE;
+	unsigned int area = get_area(address);
 
 	return area == 2 || area == 3;
 }
 
 #define CACHE_LINE_BURST_READ_PENALTY (6) // 2 base + 4 to burst read 16 bytes for a cache line
+#define CACHE_LINE_BURST_WRITE_PENALTY (4) // Only the 4 data cycles for the cache line
 #define CACHE_MISS_STALL_PENALTY (4) // 3 base (tag lookup, compare, etc...) + 1 for BSC sync
 
 static unsigned int get_wcr1_timing(uint32_t address, uint16_t wcr1)
 {
-	unsigned int area = address / SH7709S_AREA_SIZE;
+	unsigned int area = get_area(address);
 
 	if (area > 6 || area == 1)
 		return 0;
@@ -143,7 +153,7 @@ static unsigned int get_wcr1_timing(uint32_t address, uint16_t wcr1)
 
 static unsigned int get_wcr2_timing(uint32_t address, uint16_t wcr2)
 {
-	unsigned int area = address / SH7709S_AREA_SIZE;
+	unsigned int area = get_area(address);
 
 	if (area > 6 || area == 1)
 		return 0;
@@ -227,29 +237,43 @@ unsigned int sh7709s_device::access_penalty(uint32_t address, bool write)
 	unsigned int penalty = 0;
 	bool is_in_cache = cache_access(address, write);
 	bool is_wb = false;
+	bool can_use_burst = false;
 	unsigned int area = 0;
 
 	if (is_in_cache)
 		goto check_wb;
 
 wb_handle:
-	area = address / SH7709S_AREA_SIZE;
+	area = get_area(address);
+	can_use_burst = is_sdram_region(address) || area == 0;
 	// If we're swapping access area or read<->write pay the cost in WCR1 for the switch
-	if (area != m_last_area_accessed || (m_last_area_accessed_was_write && !write) || (!m_last_area_accessed_was_write && write))
+	if (area != m_last_area_accessed || (m_last_area_accessed_was_write && !is_wb) || (!m_last_area_accessed_was_write && is_wb))
 		penalty += get_wcr1_timing(address, m_wcr1);
 
 	m_last_area_accessed = area;
-	m_last_area_accessed_was_write = write;
+	m_last_area_accessed_was_write = is_wb;
 
 	// We don't really handle uncached access here but it doesn't seem to affect cv1k slowodwn
-	if (is_cacheable(address))
+	if (can_use_burst && !is_wb)
 		penalty += CACHE_LINE_BURST_READ_PENALTY;
-	if (!is_wb)
-		penalty += CACHE_MISS_STALL_PENALTY;
-	penalty += get_wcr2_timing(address, m_wcr2);
+	if (can_use_burst && is_wb)
+		penalty += CACHE_LINE_BURST_WRITE_PENALTY - 1; // First 4 bytes of the transfer overlaps the column (write) command issue so we can remove 1 cycle
+
+	// If we can't use burst timing it's gonna be pricey to access
+	if (!can_use_burst)
+		penalty += (2 + get_wcr2_timing(address, m_wcr2)) * 4;
+	else if (!is_wb) // For cache line writeback we can ignore the stall as well as CAS latency
+		penalty += CACHE_MISS_STALL_PENALTY + get_wcr2_timing(address, m_wcr2);
+
 	// On cv1k boards the SDRAM is in self refresh mode so every access is a page miss due to the page close after each fetch
 	if (is_sdram_region(address))
-		penalty += mcr_rcd(m_mcr) + mcr_tpc(m_mcr) + mcr_tras(m_mcr);
+	{
+		penalty += 2; // 2 base cycles needed for any access on the bus
+		penalty += 1 /* ACTV command issue */ + mcr_rcd(m_mcr) + 1 /* Column command issue (read/write) */ + mcr_tpc(m_mcr) + mcr_tras(m_mcr);
+		// If trcd cycles is 2 or more for sdram a NOP command to SDRAM is inserted between tr and tc1 which is trcd - 1 cycles long
+		if (mcr_rcd(m_mcr) >= 2)
+			penalty += mcr_rcd(m_mcr) - 1;
+	}
 
 check_wb:
 	// The read fetch is always handled first before any wb buffer eviction
@@ -259,10 +283,9 @@ check_wb:
 	if (m_wb_address != 0)
 	{
 		address = m_wb_address;
-		write = true;
 		is_wb = true;
 		m_wb_address = 0;
-		penalty += mcr_trwl(m_mcr) + mcr_tpc(m_mcr) + 3; // Command setup time + write waits
+		penalty += mcr_trwl(m_mcr);
 		goto wb_handle;
 	}
 

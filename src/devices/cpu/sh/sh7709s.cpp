@@ -2,6 +2,21 @@
 // copyright-holders:Jesus Ramos
 
 // SH 7709S experimental cache/memory timing
+// Some values/timing tables are hardcoded
+// (such as no bank mode timing/sdram access logic, and some area mappings)
+// for cv1k emulation specifically
+
+// Unimplemented functionality:
+// - Cache invalidation and write locking of cache lines
+// - Uncached access penalty
+// - Prefix instruction fetch timing + cache handling
+// - Checks for certain area specifics : bank mode timing for sdram access, area check for sdram, area check for burst mode + burst size
+// - TLB simulation + timing and lookups
+// - Branch predicition/mispredict penalties - Needs a branch target buffer and some basic tracking, didn't make a huge difference for cv1k when I threw one together
+// - Full pipeline simulation:
+//   Some penalties should overlap with following instructions that don't involve bus access
+//   Writeback timing for certain operations should also overlap in some cases
+//   If the CPU supports critical word first the instruction that takes the miss should be able to start as soon as that address is read in from memory even if there are further words to be read
 
 #include "sh7709s.h"
 #include "sh3comn.h"
@@ -128,12 +143,20 @@ static bool is_sdram_region(uint32_t address)
 {
 	unsigned int area = get_area(address);
 
+	// Hardcoded for now, assumes area 2 and 3 are both mapped to SDRAM
 	return area == 2 || area == 3;
+}
+
+bool can_use_burst(uint32_t address)
+{
+	// Assumes only sdram can burst read/write
+	return is_sdram_region(address);
 }
 
 #define CACHE_LINE_BURST_READ_PENALTY (6) // 2 base + 4 to burst read 16 bytes for a cache line
 #define CACHE_LINE_BURST_WRITE_PENALTY (4) // Only the 4 data cycles for the cache line
 #define CACHE_MISS_STALL_PENALTY (4) // 3 base (tag lookup, compare, etc...) + 1 for BSC sync
+#define BUS_ACCESS_PENALTY (2)
 
 static unsigned int get_wcr1_timing(uint32_t address, uint16_t wcr1)
 {
@@ -154,6 +177,7 @@ static unsigned int get_wcr1_timing(uint32_t address, uint16_t wcr1)
 static unsigned int get_wcr2_timing(uint32_t address, uint16_t wcr2)
 {
 	unsigned int area = get_area(address);
+	bool burst_capable = can_use_burst(address);
 
 	if (area > 6 || area == 1)
 		return 0;
@@ -164,7 +188,7 @@ static unsigned int get_wcr2_timing(uint32_t address, uint16_t wcr2)
 	{
 		area_val = wcr2 & 0x7;
 	}
-	else if (area == 2 || area == 3)
+	else if (area == 2 || area == 3) // These areas have their own timings
 	{
 		wcr2 >>= 3;
 		if (area == 3)
@@ -180,17 +204,33 @@ static unsigned int get_wcr2_timing(uint32_t address, uint16_t wcr2)
 		area_val = wcr2 & 0x7;
 	}
 
-	// Burst mode timings
-	switch (area_val)
+	if (burst_capable)
 	{
-	case 0: return 2;
-	case 1: return 2;
-	case 2: return 3;
-	case 3: return 4;
-	case 4: return 4;
-	case 5: return 6;
-	case 6: return 8;
-	case 7: return 10;
+		switch (area_val)
+		{
+		case 0: return 2;
+		case 1: return 2;
+		case 2: return 3;
+		case 3: return 4;
+		case 4: return 4;
+		case 5: return 6;
+		case 6: return 8;
+		case 7: return 10;
+		}
+	}
+	else
+	{
+		switch (area_val)
+		{
+		case 0: return 0;
+		case 1: return 1;
+		case 2: return 2;
+		case 3: return 3;
+		case 4: return 4;
+		case 5: return 6;
+		case 6: return 8;
+		case 7: return 10;
+		}
 	}
 
 	return 2; // Unreachable
@@ -237,7 +277,7 @@ unsigned int sh7709s_device::access_penalty(uint32_t address, bool write)
 	unsigned int penalty = 0;
 	bool is_in_cache = cache_access(address, write);
 	bool is_wb = false;
-	bool can_use_burst = false;
+	bool burst_capable = false;
 	unsigned int area = 0;
 
 	if (is_in_cache)
@@ -245,7 +285,7 @@ unsigned int sh7709s_device::access_penalty(uint32_t address, bool write)
 
 wb_handle:
 	area = get_area(address);
-	can_use_burst = is_sdram_region(address) || area == 0;
+	burst_capable = can_use_burst(address);
 	// If we're swapping access area or read<->write pay the cost in WCR1 for the switch
 	if (area != m_last_area_accessed || (m_last_area_accessed_was_write && !is_wb) || (!m_last_area_accessed_was_write && is_wb))
 		penalty += get_wcr1_timing(address, m_wcr1);
@@ -254,22 +294,26 @@ wb_handle:
 	m_last_area_accessed_was_write = is_wb;
 
 	// We don't really handle uncached access here but it doesn't seem to affect cv1k slowodwn
-	if (can_use_burst && !is_wb)
+	if (burst_capable && !is_wb)
 		penalty += CACHE_LINE_BURST_READ_PENALTY;
-	if (can_use_burst && is_wb)
+	if (burst_capable && is_wb)
 		penalty += CACHE_LINE_BURST_WRITE_PENALTY - 1; // First 4 bytes of the transfer overlaps the column (write) command issue so we can remove 1 cycle
 
 	// If we can't use burst timing it's gonna be pricey to access
-	if (!can_use_burst)
-		penalty += (2 + get_wcr2_timing(address, m_wcr2)) * 4;
+	// Each access will have to initiate bus access and wait to read 4 words for the cache line fill
+	if (!burst_capable)
+		penalty += (BUS_ACCESS_PENALTY + get_wcr2_timing(address, m_wcr2)) * 4;
 	else if (!is_wb) // For cache line writeback we can ignore the stall as well as CAS latency
 		penalty += CACHE_MISS_STALL_PENALTY + get_wcr2_timing(address, m_wcr2);
 
 	// On cv1k boards the SDRAM is in self refresh mode so every access is a page miss due to the page close after each fetch
 	if (is_sdram_region(address))
 	{
-		penalty += 2; // 2 base cycles needed for any access on the bus
-		penalty += 1 /* ACTV command issue */ + mcr_rcd(m_mcr) + 1 /* Column command issue (read/write) */ + mcr_tpc(m_mcr) + mcr_tras(m_mcr);
+		penalty += BUS_ACCESS_PENALTY +
+			1 /* ACTV command issue */ +
+			mcr_rcd(m_mcr) +
+			1 /* Column command issue (read/write), for writes this overlaps the first word write */ +
+			mcr_tpc(m_mcr) + mcr_tras(m_mcr);
 		// If trcd cycles is 2 or more for sdram a NOP command to SDRAM is inserted between tr and tc1 which is trcd - 1 cycles long
 		if (mcr_rcd(m_mcr) >= 2)
 			penalty += mcr_rcd(m_mcr) - 1;

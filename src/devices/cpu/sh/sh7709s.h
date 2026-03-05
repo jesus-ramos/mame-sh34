@@ -12,6 +12,8 @@
 #define SH7709S_CACHE_ASSOCIATIVITY (4)
 #define SH7709S_CACHE_BLOCKS (SH7709S_CACHE_ENTRY_COUNT / SH7709S_CACHE_ASSOCIATIVITY)
 
+// U bit tracked in the dirty field, V bit currently untracked
+// Assumes all cache lines are valid as cache line invalidation is unimplemented
 struct sh7709s_cache_entry
 {
 	uint32_t tag; // Address tag for entry

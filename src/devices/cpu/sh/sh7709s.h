@@ -10,6 +10,36 @@
 // Heavy on CPU usage but useful for debugging icache penalties if your cpu can handle it
 #define SH7709S_ICACHE_TRACKING_HEAVY (0)
 
+// Sparse instruction-fetch miss approximation
+// Instruction fetches are only sampled at data accesses, so this estimates the
+// IF misses the fetch stream incurred between samples from the cache residency
+// of a small window of lines around the sampled pc, scaled by the cycle interval
+// since the previous sample.
+
+// Number of 16-byte cache lines around the sampled pc checked for residency
+#define SH7709S_IF_WINDOW_LINES (8)
+// Window residency % at or above which the fetch stream is treated as hitting
+#define SH7709S_IF_RESIDENT_THRESHOLD_PCT (75)
+// Cap on the per-interval IF penalty as a multiple of the interval length
+#define SH7709S_IF_PENALTY_MAX_SCALE (1)
+// Safety net to maintain save state compat while testing
+#define SH7709S_IF_MAX_INTERVAL (1000000)
+
+
+// SH7709S has a unified cache which means that not all cache hits are "free"
+// Cache hits while the fill is happening stall on fill wait (easy to handle).
+// Cache hits while an instruction fetch need to happen stall the instruction fetch,
+// this is where the trouble starts. As sampling every PC access + adding instrumentation
+// for branch predictor and other bits is quite hefty we instead do some approximations
+
+// On these cache hits we calculate a budget over an interval for amount of "free"
+// cache hits we're allowed. Once that budget is consumed we start considering any
+// further ones that could have coincided with instruction fetches to stall for a cycle.
+// This models the single port unified cache contention
+
+// Cap on the accumulated free port slots
+#define SH7709S_HIT_BUDGET_MAX (4)
+
 // U bit tracked in the dirty field, V bit currently untracked
 struct sh7709s_cache_entry
 {
@@ -64,9 +94,19 @@ private:
 	unsigned int m_precharge_remaining_cycles;
 	unsigned int m_burst_continuation_remaining_cycles; // Remaining burst words still occupying the bus after the critical word lands
 	uint64_t m_last_op_cycle_count; // Track the last cycle we did a memory operation for background accounting
+	// Sparse IF miss approximation state
+	uint64_t m_last_if_sample_cycles; // total_cycles() at the last data-access sample
+	uint64_t m_last_if_sample_penalty; // cumulative memory penalty at last data-access sample
+	uint64_t m_cum_mem_penalty; // cumulative memory-access penalty charged
+	int m_hit_port_budget; // free single-port slots available to data hits
 
 	bool cache_access(uint32_t address, bool write);
-	unsigned int access_penalty(uint32_t address, bool write);
+	unsigned int access_penalty(uint32_t address, bool write, bool *bus_op, bool data_access);
+	bool cache_resident(uint32_t address);
+	uint32_t if_miss_cost(uint32_t address);
+	uint64_t if_sample_interval();
+	void refill_hit_port_budget(uint64_t interval_cycles);
+	uint32_t approximate_if_miss_penalty(uint32_t pc, uint64_t interval_cycles);
 
 	// Timing calculation/decode related functions
 	uint32_t get_wcr1_timing(uint32_t area);

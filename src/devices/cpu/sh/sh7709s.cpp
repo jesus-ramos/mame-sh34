@@ -31,6 +31,10 @@
 *   slowdown sections that at a glance don't look like they should be slowing down or causing extra
 *   slowdown.
 *
+*   The real cost above is that CAVE in their wisdom decided that flushing the cache wasn't enough (they
+*   could have set the cache to WT mode or just used uncached aliases to write to SDRAM). After the flush
+*   they invalidate the entire cache meaning *everything* has to be refetched from SDRAM at hefty stall costs.
+*
 * - The code that reads irr0 to check for irq2 also seems to have a ready modify write timing bug where
 *   the register value is read, IRQ2 is masked out of that value, then that masked value is written back.
 *   Documentation does mention in an addendum that this behavior can lead to lost IRQ's but luckily these
@@ -81,6 +85,10 @@ void sh7709s_device::device_reset()
 	m_precharge_remaining_cycles = 0;
 	m_burst_continuation_remaining_cycles = 0;
 	m_last_op_cycle_count = 0;
+	m_last_if_sample_cycles = 0;
+	m_last_if_sample_penalty = 0;
+	m_cum_mem_penalty = 0;
+	m_hit_port_budget = 0;
 }
 
 void sh7709s_device::device_start()
@@ -96,6 +104,10 @@ void sh7709s_device::device_start()
 	m_precharge_remaining_cycles = 0;
 	m_burst_continuation_remaining_cycles = 0;
 	m_last_op_cycle_count = 0;
+	m_last_if_sample_cycles = 0;
+	m_last_if_sample_penalty = 0;
+	m_cum_mem_penalty = 0;
+	m_hit_port_budget = 0;
 
 	for (int i = 0; i < SH7709S_CACHE_BLOCKS; i++)
 		for (int j = 0; j < SH7709S_CACHE_ASSOCIATIVITY; j++)
@@ -112,6 +124,10 @@ void sh7709s_device::device_start()
 	save_item(NAME(m_last_sdram_bank));
 	save_item(NAME(m_precharge_remaining_cycles));
 	save_item(NAME(m_last_op_cycle_count));
+	save_item(NAME(m_last_if_sample_cycles));
+	save_item(NAME(m_last_if_sample_penalty));
+	save_item(NAME(m_cum_mem_penalty));
+	save_item(NAME(m_hit_port_budget));
 }
 
 // Top 3 region bits allow for aliasing cached/uncached pointers to the same physical address
@@ -195,6 +211,24 @@ bool sh7709s_device::cache_access(uint32_t address, bool write)
 			break;
 		}
 	}
+
+	return false;
+}
+
+// Separate helper to check cache residency without poking the LRU
+bool sh7709s_device::cache_resident(uint32_t address)
+{
+	if (!is_cacheable(address))
+		return true;
+
+	address &= SH34_AM;
+
+	uint32_t cache_address = address / SH7709S_CACHE_LINE_SIZE;
+	uint32_t cache_block = cache_address % SH7709S_CACHE_BLOCKS;
+
+	for (int i = 0; i < SH7709S_CACHE_ASSOCIATIVITY; i++)
+		if (m_cache[cache_block][i].tag == cache_address)
+			return true;
 
 	return false;
 }
@@ -320,9 +354,8 @@ uint32_t sh7709s_device::cache_line_fetch_count(uint32_t address)
 	return SH7709S_CACHE_LINE_SIZE >> (bcr2_val - 1);
 }
 
-// Unconfirmed behavior but the math works out based on comparison of misses in a frame to pcb footage
-// This covers a pipeline where we go from miss detect -> victim select -> address to BSC
-#define CACHE_MISS_STALL (3)
+// Single cycle miss cost
+#define CACHE_MISS_STALL (1)
 
 static uint64_t remaining_cycles(uint64_t elapsed, uint64_t cycles)
 {
@@ -330,18 +363,42 @@ static uint64_t remaining_cycles(uint64_t elapsed, uint64_t cycles)
 }
 
 // cpu->bus cycle conversion hardcoded to 2x as cv1k sh3 runs the bus at 50mhz
-unsigned int sh7709s_device::access_penalty(uint32_t address, bool write)
+unsigned int sh7709s_device::access_penalty(uint32_t address, bool write, bool *bus_op, bool data_access)
 {
 	bool is_in_cache = cache_access(address, write);
+	uint64_t elapsed_cycles = total_cycles() - m_last_op_cycle_count;
+
+	*bus_op = false;
 
 	if (is_in_cache)
+	{
+		if (m_burst_continuation_remaining_cycles && elapsed_cycles < m_burst_continuation_remaining_cycles)
+		{
+			uint32_t cache_hit_stall = m_burst_continuation_remaining_cycles - elapsed_cycles;
+			m_burst_continuation_remaining_cycles = 0;
+			*bus_op = true;
+			return cache_hit_stall;
+		}
+
+#if (SH7709S_ICACHE_TRACKING_HEAVY == 0)
+		// On data access consume our budget allocated for this interval if we have one,
+		// otherwise we have to steal 1 cycle from the IF stage
+		if (data_access)
+		{
+			if (m_hit_port_budget > 0)
+				m_hit_port_budget--;
+			else
+				return 1;
+		}
+#endif
 		return 0;
+	}
+
+	*bus_op = true;
 
 	uint32_t area = get_area(address);
-	uint64_t elapsed_cycles = total_cycles() - m_last_op_cycle_count;
 	uint32_t cpu_penalty = is_cacheable(address) ? CACHE_MISS_STALL : 0;
-	uint32_t bank_read = sdram_bank(address);
-	uint32_t bus_penalty = 1; // CPU -> BSC sync cost
+	uint32_t bus_penalty = 0;
 
 	// SDRAM timing based on SH7709S documentation
 	// These are copied from the timing charts. These are all in bus cycles
@@ -430,9 +487,6 @@ unsigned int sh7709s_device::access_penalty(uint32_t address, bool write)
 		m_wb_active_cycles = 0;
 	}
 
-	if (is_sdram_region(address))
-		m_last_sdram_bank = bank_read;
-
 	// We had a dirty writeback eviction, total up the background cost penalty we'll pay on subsequent cycles
 	if (m_wb_address != 0)
 	{
@@ -446,7 +500,7 @@ unsigned int sh7709s_device::access_penalty(uint32_t address, bool write)
 			m_burst_continuation_remaining_cycles = 0;
 			// since this is a dirty cache line eviction we always add wcr1 as it's handled after the miss fetch read
 			// and we're switching from read->write
-			m_wb_active_cycles += (2 + mcr_rcd() + 4 + mcr_trwl() + get_wcr1_timing(area) + mcr_tpc()) * 2;
+			m_wb_active_cycles += (1 + mcr_rcd() + 4 + mcr_trwl() + get_wcr1_timing(area) + mcr_tpc()) * 2;
 		}
 		else
 		{
@@ -464,19 +518,120 @@ unsigned int sh7709s_device::access_penalty(uint32_t address, bool write)
 	return cpu_penalty + (bus_penalty * 2);
 }
 
+uint32_t sh7709s_device::if_miss_cost(uint32_t address)
+{
+	return CACHE_MISS_STALL + (1 + mcr_rcd() + get_wcr2_timing(address) + 3) * 2;
+}
+
+// Here be dragons
+// A lot of misses happen in relatively tight windows of accesses, we can use that to our advantage
+// and use that to approximate these penalties via direct sampling on memory access (we account for those already)
+// and via a bit of indirect sampling checking surrounding accesses.
+// Some of the math here is semi arbitrary and relies on specific behavior in cv1k titles so may not
+// be applicable to other workloads
+uint32_t sh7709s_device::approximate_if_miss_penalty(uint32_t pc, uint64_t interval_cycles)
+{
+	// m_last_if_sample_cycles is set in update_access_cycles AFTER the previous
+	// charge is applied, so our own penalty is never part of the interval this
+	// prevents the estimate from feeding back on itself and running away and causing
+	// the game to hang
+	uint64_t penalty_this_interval = (m_cum_mem_penalty > m_last_if_sample_penalty) ? (m_cum_mem_penalty - m_last_if_sample_penalty) : 0;
+	m_last_if_sample_penalty = m_cum_mem_penalty;
+
+	if (!is_cacheable(pc) || interval_cycles == 0)
+		return 0;
+
+	// Estimate base instruction cycles by stripping out the memory penalties we
+	// already accounted for
+	uint64_t base_cycles = (interval_cycles > penalty_this_interval) ? (interval_cycles - penalty_this_interval) : 0;
+	uint64_t fetches = base_cycles / 2; // 1 32-bit fetch per 2 instruction cycles
+	if (fetches == 0)
+		return 0;
+
+	// Residency sample over a window of lines around the sampled pc
+	// We cut the window down the middle to check equal lines above/below it
+	uint32_t window_start = (pc & ~(SH7709S_CACHE_LINE_SIZE - 1)) - (SH7709S_CACHE_LINE_SIZE * (SH7709S_IF_WINDOW_LINES / 2));
+	uint32_t resident = 0;
+	for (uint32_t i = 0; i < SH7709S_IF_WINDOW_LINES; i++)
+	{
+		uint32_t addr = window_start + (i * SH7709S_CACHE_LINE_SIZE);
+		if (is_cacheable(addr) && cache_resident(addr))
+			resident++;
+	}
+
+	// At 6/8 lines resident we consider it good
+	uint32_t resident_pct = (resident * 100) / SH7709S_IF_WINDOW_LINES;
+	if (resident_pct >= SH7709S_IF_RESIDENT_THRESHOLD_PCT)
+		return 0;
+
+	// Depending on how far we stray from the threshold use that to approximate a miss count
+	uint32_t miss_pct = 100 - resident_pct;
+	uint64_t misses = (fetches * miss_pct) / 100;
+	if (misses == 0)
+		return 0;
+
+	// Cap the penalty in case the approximation goes wild
+	uint64_t penalty = misses * if_miss_cost(pc);
+	uint64_t cap = interval_cycles * SH7709S_IF_PENALTY_MAX_SCALE;
+	if (penalty > cap)
+		penalty = cap;
+
+	return (uint32_t)penalty;
+}
+
+// This is mostly used as a safety clamp so that testing could be done with older save states
+// where loading a state would cause this value to blow up
+uint64_t sh7709s_device::if_sample_interval()
+{
+	uint64_t now = total_cycles();
+	if (m_last_if_sample_cycles == 0 || now <= m_last_if_sample_cycles)
+		return 0;
+
+	uint64_t interval = now - m_last_if_sample_cycles;
+	return (interval > SH7709S_IF_MAX_INTERVAL) ? 0 : interval;
+}
+
+// Recalculate the budget after sampling, also cap the budget so we don't get too crazy
+// handing these out if the interval is very large. Each fetch grabs 2 instructions
+// so 1 cycle can handle 2 instruction fetches
+void sh7709s_device::refill_hit_port_budget(uint64_t interval_cycles)
+{
+	m_hit_port_budget += (int32_t)std::min<uint64_t>(interval_cycles / 2, SH7709S_HIT_BUDGET_MAX * 4);
+	if (m_hit_port_budget > SH7709S_HIT_BUDGET_MAX)
+		m_hit_port_budget = SH7709S_HIT_BUDGET_MAX;
+	if (m_hit_port_budget < 0)
+		m_hit_port_budget = 0;
+}
+
 void sh7709s_device::update_access_cycles(uint32_t address, bool write)
 {
+	bool bus_op;
 #if SH7709S_ICACHE_TRACKING_HEAVY == 0
 	// For now only handle cacheable instruction fetch sampling when we do
 	// data accesses. The majority of uncached instruction fetches is
 	// handled in the cache flush timing
 	if (is_cacheable(m_sh2_state->pc)) {
-		m_sh2_state->icount -= access_penalty(m_sh2_state->pc, false);
-		m_last_op_cycle_count = total_cycles();
+		uint32_t if_sample_penalty = access_penalty(m_sh2_state->pc, false, &bus_op, false);
+		m_sh2_state->icount -= if_sample_penalty;
+		m_cum_mem_penalty += if_sample_penalty;
+		if (bus_op)
+			m_last_op_cycle_count = total_cycles();
 	}
 #endif
-	m_sh2_state->icount -= access_penalty(address, write);
-	m_last_op_cycle_count = total_cycles();
+	uint32_t data_penalty = access_penalty(address, write, &bus_op, true);
+	m_sh2_state->icount -= data_penalty;
+	m_cum_mem_penalty += data_penalty;
+	if (bus_op)
+		m_last_op_cycle_count = total_cycles();
+
+#if SH7709S_ICACHE_TRACKING_HEAVY == 0
+	uint64_t interval = if_sample_interval();
+	refill_hit_port_budget(interval);
+	// Sparse approximation of the instruction-fetch misses that occurred in
+	// between data accesses
+	m_sh2_state->icount -= approximate_if_miss_penalty(m_sh2_state->pc, interval);
+	m_last_if_sample_cycles = total_cycles();
+#endif
 }
 
 void sh7709s_device::drc_memory_access_read()
